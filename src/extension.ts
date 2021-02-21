@@ -102,6 +102,7 @@ import { getBoards } from "./espIdf/openOcd/boardConfiguration";
 import { generateConfigurationReport } from "./support";
 import { initializeReportObject } from "./support/initReportObj";
 import { writeTextReport } from "./support/writeReport";
+import { kill } from "process";
 
 // Global variables shared by commands
 let workspaceRoot: vscode.Uri;
@@ -315,7 +316,10 @@ export async function activate(context: vscode.ExtensionContext) {
     debugAdapterManager.stop();
     if (isMonitorLaunchedByDebug) {
       isMonitorLaunchedByDebug = false;
-      monitorTerminal.dispose();
+      monitorTerminal.processId.then((monitorPid) => {
+        kill(monitorPid, "SIGKILL");
+        monitorTerminal.dispose();
+      });
     }
   });
 
@@ -341,13 +345,6 @@ export async function activate(context: vscode.ExtensionContext) {
     ConfserverProcess.dispose();
   });
   context.subscriptions.push(sdkDeleteWatchDisposable);
-
-  vscode.window.onDidCloseTerminal((terminal: vscode.Terminal) => {
-    terminal.dispose();
-    setTimeout(() => {
-      monitorTerminal = undefined;
-    }, 200);
-  });
 
   registerIDFCommand("espIdf.createFiles", async () => {
     PreCheck.perform([openFolderCheck], async () => {
@@ -946,15 +943,36 @@ export async function activate(context: vscode.ExtensionContext) {
   registerIDFCommand("espIdf.getXtensaGdb", () => {
     return PreCheck.perform([openFolderCheck], async () => {
       const modifiedEnv = utils.appendIdfAndToolsToPath();
+      const idfTarget = modifiedEnv.IDF_TARGET || "esp32";
       try {
         return await utils.isBinInPath(
-          "xtensa-esp32-elf-gdb",
+          `xtensa-${idfTarget}-elf-gdb`,
           workspaceRoot.fsPath,
           modifiedEnv
         );
       } catch (error) {
         Logger.errorNotify(
-          "xtensa-esp32-elf-gdb is not found in idf.customExtraPaths",
+          "xtensa-TARGET-elf-gdb is not found in idf.customExtraPaths",
+          error
+        );
+        return;
+      }
+    });
+  });
+
+  registerIDFCommand("espIdf.getXtensaGcc", () => {
+    return PreCheck.perform([openFolderCheck], async () => {
+      const modifiedEnv = utils.appendIdfAndToolsToPath();
+      const idfTarget = modifiedEnv.IDF_TARGET || "esp32";
+      try {
+        return await utils.isBinInPath(
+          `xtensa-${idfTarget}-elf-gcc`,
+          workspaceRoot.fsPath,
+          modifiedEnv
+        );
+      } catch (error) {
+        Logger.errorNotify(
+          "xtensa-TARGET-elf-gcc is not found in idf.customExtraPaths",
           error
         );
         return;
@@ -973,6 +991,27 @@ export async function activate(context: vscode.ExtensionContext) {
         const errMsg = error.message || "Error creating .vscode folder";
         Logger.errorNotify(errMsg, error);
         return;
+      }
+    });
+  });
+
+  registerIDFCommand("espIdf.createNewComponent", async () => {
+    PreCheck.perform([openFolderCheck], async () => {
+      try {
+        const componentName = await vscode.window.showInputBox({
+          placeHolder: "Enter ESP-IDF component name",
+          value: "",
+        });
+        if (!componentName) {
+          return;
+        }
+        await utils.createNewComponent(componentName, workspaceRoot.fsPath);
+        Logger.infoNotify(
+          `The ESP-IDF component ${componentName} has been created`
+        );
+      } catch (error) {
+        const errMsg = error.message || "Error creating ESP-IDF component";
+        return Logger.errorNotify(errMsg, error);
       }
     });
   });
@@ -1019,6 +1058,16 @@ export async function activate(context: vscode.ExtensionContext) {
         Logger.errorNotify(error.message, error);
       }
     });
+  });
+
+  registerIDFCommand("espIdf.disposeConfserverProcess", () => {
+    try {
+      if (ConfserverProcess.exists()) {
+        ConfserverProcess.dispose();
+      }
+    } catch (error) {
+      Logger.errorNotify(error.message, error);
+    }
   });
 
   registerIDFCommand("espIdf.setTarget", () => {
@@ -1877,6 +1926,42 @@ export async function activate(context: vscode.ExtensionContext) {
       }
     );
   });
+
+  registerIDFCommand("espIdf.ninja.summary", async () => {
+    vscode.window.withProgress(
+      {
+        title: "Getting ninja build summary",
+        location: vscode.ProgressLocation.Notification,
+      },
+      async () => {
+        try {
+          const pythonBinPath = idfConf.readParameter(
+            "idf.pythonBinPath"
+          ) as string;
+          const ninjaSummaryScript = path.join(
+            context.extensionPath,
+            "external",
+            "chromium",
+            "ninja-build-summary.py"
+          );
+          const buildDir = path.join(workspaceRoot.fsPath, "build");
+          const summaryResult = await utils.execChildProcess(
+            `${pythonBinPath} ${ninjaSummaryScript} -C ${buildDir}`,
+            workspaceRoot.fsPath,
+            OutputChannel.init()
+          );
+          OutputChannel.appendLine(
+            `Ninja build summary - ${Date().toLocaleString()}`
+          );
+          OutputChannel.appendLine(summaryResult);
+          OutputChannel.show();
+        } catch (error) {
+          Logger.errorNotify("Ninja build summary found an error", error);
+        }
+      }
+    );
+  });
+
   registerIDFCommand("espIdf.jtag_flash", () => {
     PreCheck.perform(
       [openFolderCheck, webIdeCheck, minOpenOCDVersion20201125],
@@ -2214,6 +2299,8 @@ const flash = () => {
 
     if (monitorTerminal) {
       Logger.warnNotify("ESP-IDF Monitor was closed.");
+      const monitorPid = await monitorTerminal.processId;
+      kill(monitorPid, "SIGKILL");
       monitorTerminal.dispose();
       setTimeout(() => {
         monitorTerminal = undefined;
@@ -2346,6 +2433,8 @@ const buildFlashAndMonitor = (runMonitor: boolean = true) => {
     }
     if (monitorTerminal) {
       Logger.warnNotify("ESP-IDF Monitor was closed.");
+      const monitorPid = await monitorTerminal.processId;
+      kill(monitorPid, "SIGKILL");
       monitorTerminal.dispose();
       setTimeout(() => {
         monitorTerminal = undefined;
@@ -2624,7 +2713,10 @@ function overrideVscodeTerminalWithIdfEnv(
 export function deactivate() {
   Telemetry.dispose();
   if (monitorTerminal) {
-    monitorTerminal.dispose();
+    monitorTerminal.processId.then((monitorPid) => {
+      kill(monitorPid, "SIGKILL");
+      monitorTerminal.dispose();
+    });
   }
   OutputChannel.end();
 
